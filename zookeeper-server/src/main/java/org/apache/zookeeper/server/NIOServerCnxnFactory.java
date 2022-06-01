@@ -38,8 +38,12 @@ import java.util.Queue;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.LinkedBlockingQueue;
+
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+
+import static org.apache.zookeeper.common.IPFilterUtil.COMMA;
+import static org.apache.zookeeper.common.IPFilterUtil.EMPTY_STRING;
 
 /**
  * NIOServerCnxnFactory implements a multi-threaded ServerCnxnFactory using
@@ -175,6 +179,21 @@ public class NIOServerCnxnFactory extends ServerCnxnFactory {
         }
 
         public void run() {
+            // add by our team
+            if( !isStartedUpdateLimitedIpListFromPath ){
+                IPFilterUtil.startThread(new Runnable() {
+                    @Override
+                    public void run() {
+                        while(true) {
+                            try {
+                                Thread.sleep(10*1000);
+                            } catch (InterruptedException e) {
+                                updateLimitedIpListFromPath();
+                            }
+                        }
+                    }
+                });
+            }
             try {
                 while (!stopped && !acceptSocket.socket().isClosed()) {
                     try {
@@ -268,21 +287,46 @@ public class NIOServerCnxnFactory extends ServerCnxnFactory {
                 if (maxClientCnxns > 0 && cnxncount >= maxClientCnxns) {
                     throw new IOException("Too many connections from " + ia + " - max is " + maxClientCnxns);
                 }
+                //add by our team
+                // check if client limited
+                //12todo
+                if( !NIOServerCnxn.skipLimitedIp && null != ia && NIOServerCnxn.limitedIpMap.containsKey( IPFilterUtil.trimToEmpty( ia.getHostAddress() ) ) ){
+                    LOG.warn( ia + " is a limited client, zk Server refused it!" );
+                    sc.close();
+                } else {
+                    if (maxClientCnxns > 0 && cnxncount >= maxClientCnxns) {
+                        LOG.warn("Too many connections from " + ia
+                                + " - max is " + maxClientCnxns);
+                        sc.close();
+                        accepted = false;
 
-                LOG.debug("Accepted socket connection from {}", sc.socket().getRemoteSocketAddress());
+                    } else {
+//                        LOG.info("Accepted socket connection from "
+//                                + sc.socket().getRemoteSocketAddress());
+//                        sc.configureBlocking(false);
+//                        SelectionKey sk = sc.register(selector,
+//                                SelectionKey.OP_READ);
+//                        NIOServerCnxn cnxn = createConnection(sc, sk);
+//                        sk.attach(cnxn);
+//                        addCnxn(cnxn);
+//                        return accepted;
+                        LOG.debug("Accepted socket connection from {}", sc.socket().getRemoteSocketAddress());
 
-                sc.configureBlocking(false);
+                        sc.configureBlocking(false);
 
-                // Round-robin assign this connection to a selector thread
-                if (!selectorIterator.hasNext()) {
-                    selectorIterator = selectorThreads.iterator();
+                        // Round-robin assign this connection to a selector thread
+                        if (!selectorIterator.hasNext()) {
+                            selectorIterator = selectorThreads.iterator();
+                        }
+                        SelectorThread selectorThread = selectorIterator.next();
+                        if (!selectorThread.addAcceptedConnection(sc)) {
+                            throw new IOException("Unable to add connection to selector queue"
+                                    + (stopped ? " (shutdown in progress)" : ""));
+                        }
+                        acceptErrorLogger.flush();
+                    }
                 }
-                SelectorThread selectorThread = selectorIterator.next();
-                if (!selectorThread.addAcceptedConnection(sc)) {
-                    throw new IOException("Unable to add connection to selector queue"
-                                          + (stopped ? " (shutdown in progress)" : ""));
-                }
-                acceptErrorLogger.flush();
+
             } catch (IOException e) {
                 // accept, maxClientCnxns, configureBlocking
                 ServerMetrics.getMetrics().CONNECTION_REJECTED.add(1);
@@ -293,7 +337,49 @@ public class NIOServerCnxnFactory extends ServerCnxnFactory {
         }
 
     }
+    // add by our team
+    private final static String PATH_SKIP_LIMITED_IP = "/zookeeper/extends/skip_limited_ip";
+    private final static String PATH_LIMITED_IP 	 = "/zookeeper/extends/limited_ip";
+    private boolean isStartedUpdateLimitedIpListFromPath = false;
 
+
+    /** Update the limitedIpMap*/
+    private boolean updateLimitedIpListFromPath(){
+        String limitedIpStr = EMPTY_STRING;
+        try {
+            DataNode node = null;
+            ZKDatabase zkDatabase = null;
+
+            if (null != zks && null != (zkDatabase = zks.getZKDatabase())) {
+                node = zkDatabase.getNode(PATH_LIMITED_IP);
+                if (null != node && null != node.data) {
+                    limitedIpStr = new String(node.data);
+                }
+                node = zkDatabase.getNode(PATH_SKIP_LIMITED_IP);
+                if (null != node && null != node.data) {
+                    if (IPFilterUtil.trimToEmpty(new String(node.data)).contains("false")) {
+
+                        NIOServerCnxn.skipLimitedIp = false;
+
+                    } else {
+
+                        NIOServerCnxn.skipLimitedIp = true;
+                    }
+                }
+
+                NIOServerCnxn.limitedIpMap = IPFilterUtil.parseMap(limitedIpStr, COMMA);
+                //12todo
+                LOG.info("NIOServerCnxn.Factory.skipLimitedIp: " + NIOServerCnxn.skipLimitedIp);
+                LOG.info("Finish updateLimitedIpListFromPath, size: " + NIOServerCnxn.limitedIpMap.size());
+                return true;
+            }
+        } catch (Exception e) {
+            LOG.error("Error when updateLimitedIpListFromPath: " + PATH_LIMITED_IP + ", error: " + e.getMessage());
+            return false;
+        }
+        return true;
+    }
+    ZooKeeperServer zks;
     /**
      * The SelectorThread receives newly accepted connections from the
      * AcceptThread and is responsible for selecting for I/O readiness
@@ -347,13 +433,15 @@ public class NIOServerCnxnFactory extends ServerCnxnFactory {
          * reads/sets are potentially blocking operations if other select
          * operations are happening.
          */
-        public boolean addInterestOpsUpdateRequest(SelectionKey sk) {
+        public boolean addInterestOpsUpdateRequest(SelectionKey sk) {:1
+
             if (stopped || !updateQueue.offer(sk)) {
                 return false;
             }
             wakeupSelector();
             return true;
         }
+
 
         /**
          * The main loop for the thread selects() on the connections and
@@ -362,7 +450,9 @@ public class NIOServerCnxnFactory extends ServerCnxnFactory {
          * queue.
          */
         public void run() {
+
             try {
+
                 while (!stopped) {
                     try {
                         select();

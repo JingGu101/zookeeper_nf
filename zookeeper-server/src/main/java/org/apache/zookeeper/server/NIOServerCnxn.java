@@ -19,6 +19,9 @@
 package org.apache.zookeeper.server;
 
 import static java.nio.charset.StandardCharsets.UTF_8;
+import static org.apache.zookeeper.common.IPFilterUtil.COMMA;
+import static org.apache.zookeeper.common.IPFilterUtil.EMPTY_STRING;
+
 import java.io.BufferedWriter;
 import java.io.IOException;
 import java.io.PrintWriter;
@@ -30,7 +33,9 @@ import java.nio.channels.CancelledKeyException;
 import java.nio.channels.SelectionKey;
 import java.nio.channels.SocketChannel;
 import java.security.cert.Certificate;
+import java.util.Map;
 import java.util.Queue;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.atomic.AtomicBoolean;
 import org.apache.jute.BinaryInputArchive;
@@ -55,10 +60,10 @@ import org.slf4j.LoggerFactory;
  * client, but only one thread doing the communication.
  */
 public class NIOServerCnxn extends ServerCnxn {
-
-    private static final Logger LOG = LoggerFactory.getLogger(NIOServerCnxn.class);
-
     private final NIOServerCnxnFactory factory;
+    public static boolean skipLimitedIp = true;
+    public static  Map< String, String > limitedIpMap = new ConcurrentHashMap< String, String >();
+    private static final Logger LOG = LoggerFactory.getLogger(NIOServerCnxn.class);
 
     private final SocketChannel sock;
 
@@ -104,6 +109,11 @@ public class NIOServerCnxn extends ServerCnxn {
         addAuthInfo(new Id("ip", addr.getHostAddress()));
         this.sessionTimeout = factory.sessionlessCnxnTimeout;
     }
+
+
+
+
+
 
     /* Send close connection packet to the client, doIO will eventually
      * close the underlying machinery (like socket, selectorkey, etc...)
