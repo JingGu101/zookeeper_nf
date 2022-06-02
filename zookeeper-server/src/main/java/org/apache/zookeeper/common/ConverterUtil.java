@@ -5,24 +5,24 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 
-public class IPFilterUtil {
+public class ConverterUtil {
     public final static String EMPTY_STRING = "";
 
     public final static String COMMA = ",";
 
     public static List<String> parseList(String originalStr, String splitStr) {
         List<String> list = new ArrayList<String>();
-        if (IPFilterUtil.isBlank(originalStr) || IPFilterUtil.isBlank(splitStr))
+        if (ConverterUtil.isBlank(originalStr) || ConverterUtil.isBlank(splitStr))
             return list;
-        return IPFilterUtil.toArrayList(originalStr.split(splitStr));
+        return ConverterUtil.toArrayList(originalStr.split(splitStr));
 
     }
 
     public static Map<String, String> parseMap(String originalStr, String splitStr) {
         Map<String, String> map = new LinkedHashMap<String, String>();
-        if (IPFilterUtil.isBlank(originalStr) || IPFilterUtil.isBlank(splitStr))
+        if (ConverterUtil.isBlank(originalStr) || ConverterUtil.isBlank(splitStr))
             return map;
-        List<String> list = IPFilterUtil.toArrayList(originalStr.split(splitStr));
+        List<String> list = ConverterUtil.toArrayList(originalStr.split(splitStr));
         for (String ip : list) {
             ip = trimToEmpty(ip);
             map.put(ip, ip);

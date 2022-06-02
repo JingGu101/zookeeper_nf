@@ -19,15 +19,9 @@
 package org.apache.zookeeper.server;
 
 import static java.nio.charset.StandardCharsets.UTF_8;
-import io.netty.buffer.ByteBuf;
-import io.netty.buffer.ByteBufUtil;
-import io.netty.buffer.CompositeByteBuf;
-import io.netty.buffer.Unpooled;
-import io.netty.channel.Channel;
-import io.netty.channel.ChannelFuture;
-import io.netty.channel.ChannelFutureListener;
-import io.netty.util.concurrent.Future;
-import io.netty.util.concurrent.GenericFutureListener;
+import static org.apache.zookeeper.common.ConverterUtil.COMMA;
+import static org.apache.zookeeper.common.ConverterUtil.EMPTY_STRING;
+
 import java.io.BufferedWriter;
 import java.io.IOException;
 import java.io.PrintWriter;
@@ -35,18 +29,25 @@ import java.io.Writer;
 import java.net.InetAddress;
 import java.net.InetSocketAddress;
 import java.nio.ByteBuffer;
+import java.nio.channels.CancelledKeyException;
 import java.nio.channels.SelectionKey;
+import java.nio.channels.SocketChannel;
 import java.security.cert.Certificate;
-import java.util.Arrays;
+import java.util.Map;
+import java.util.Queue;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.atomic.AtomicBoolean;
 import org.apache.jute.BinaryInputArchive;
 import org.apache.jute.Record;
 import org.apache.zookeeper.ClientCnxn;
 import org.apache.zookeeper.WatchedEvent;
+import org.apache.zookeeper.ZooDefs;
 import org.apache.zookeeper.data.Id;
 import org.apache.zookeeper.data.Stat;
 import org.apache.zookeeper.proto.ReplyHeader;
 import org.apache.zookeeper.proto.WatcherEvent;
+import org.apache.zookeeper.server.NIOServerCnxnFactory.SelectorThread;
 import org.apache.zookeeper.server.command.CommandExecutor;
 import org.apache.zookeeper.server.command.FourLetterCommands;
 import org.apache.zookeeper.server.command.NopCommand;
@@ -54,168 +55,386 @@ import org.apache.zookeeper.server.command.SetTraceMaskCommand;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-public class NettyServerCnxn extends ServerCnxn {
+/**
+ * This class handles communication with clients using NIO. There is one per
+ * client, but only one thread doing the communication.
+ */
+public class NIOServerCnxn extends ServerCnxn {
+    private final NIOServerCnxnFactory factory;
+    public static boolean skipLimitedIp = true;
+    public static  Map< String, String > limitedIpMap = new ConcurrentHashMap< String, String >();
+    private static final Logger LOG = LoggerFactory.getLogger(NIOServerCnxn.class);
 
-    private static final Logger LOG = LoggerFactory.getLogger(NettyServerCnxn.class);
-    private final Channel channel;
-    private CompositeByteBuf queuedBuffer;
-    private final AtomicBoolean throttled = new AtomicBoolean(false);
-    private ByteBuffer bb;
-    private final ByteBuffer bbLen = ByteBuffer.allocate(4);
-    private long sessionId;
-    private int sessionTimeout;
-    private Certificate[] clientChain;
-    private volatile boolean closingChannel;
+    private final SocketChannel sock;
 
-    private final NettyServerCnxnFactory factory;
+    private final SelectorThread selectorThread;
+
+    private final SelectionKey sk;
+
     private boolean initialized;
 
-    public int readIssuedAfterReadComplete;
+    private final ByteBuffer lenBuffer = ByteBuffer.allocate(4);
 
-    private volatile HandshakeState handshakeState = HandshakeState.NONE;
+    protected ByteBuffer incomingBuffer = lenBuffer;
 
-    public enum HandshakeState {
-        NONE,
-        STARTED,
-        FINISHED
-    }
+    private final Queue<ByteBuffer> outgoingBuffers = new LinkedBlockingQueue<ByteBuffer>();
 
-    NettyServerCnxn(Channel channel, ZooKeeperServer zks, NettyServerCnxnFactory factory) {
-        super(zks);
-        this.channel = channel;
-        this.closingChannel = false;
+    private int sessionTimeout;
+
+    /**
+     * This is the id that uniquely identifies the session of a client. Once
+     * this session is no longer active, the ephemeral nodes will go away.
+     */
+    private long sessionId;
+
+    /**
+     * Client socket option for TCP keepalive
+     */
+    private final boolean clientTcpKeepAlive = Boolean.getBoolean("zookeeper.clientTcpKeepAlive");
+
+    public NIOServerCnxn(ZooKeeperServer zk, SocketChannel sock, SelectionKey sk, NIOServerCnxnFactory factory, SelectorThread selectorThread) throws IOException {
+        super(zk);
+        this.sock = sock;
+        this.sk = sk;
         this.factory = factory;
+        this.selectorThread = selectorThread;
         if (this.factory.login != null) {
             this.zooKeeperSaslServer = new ZooKeeperSaslServer(factory.login);
         }
-        InetAddress addr = ((InetSocketAddress) channel.remoteAddress()).getAddress();
+        sock.socket().setTcpNoDelay(true);
+        /* set socket linger to false, so that socket close does not block */
+        sock.socket().setSoLinger(false, -1);
+        sock.socket().setKeepAlive(clientTcpKeepAlive);
+        InetAddress addr = ((InetSocketAddress) sock.socket().getRemoteSocketAddress()).getAddress();
         addAuthInfo(new Id("ip", addr.getHostAddress()));
+        this.sessionTimeout = factory.sessionlessCnxnTimeout;
+    }
+
+
+
+
+
+
+    /* Send close connection packet to the client, doIO will eventually
+     * close the underlying machinery (like socket, selectorkey, etc...)
+     */
+    public void sendCloseSession() {
+        sendBuffer(ServerCnxnFactory.closeConn);
     }
 
     /**
-     * Close the cnxn and remove it from the factory cnxns list.
+     * send buffer without using the asynchronous
+     * calls to selector and then close the socket
+     * @param bb
      */
-    @Override
-    public void close(DisconnectReason reason) {
-        disconnectReason = reason;
-        close();
-    }
-
-    public void close() {
-        closingChannel = true;
-
-        LOG.debug("close called for session id: 0x{}", Long.toHexString(sessionId));
-
-        setStale();
-
-        // ZOOKEEPER-2743:
-        // Always unregister connection upon close to prevent
-        // connection bean leak under certain race conditions.
-        factory.unregisterConnection(this);
-
-        // if this is not in cnxns then it's already closed
-        if (!factory.cnxns.remove(this)) {
-            LOG.debug("cnxns size:{}", factory.cnxns.size());
-            if (channel.isOpen()) {
-                channel.close();
-            }
-            return;
-        }
-
-        LOG.debug("close in progress for session id: 0x{}", Long.toHexString(sessionId));
-
-        factory.removeCnxnFromSessionMap(this);
-
-        factory.removeCnxnFromIpMap(this, ((InetSocketAddress) channel.remoteAddress()).getAddress());
-
-        if (zkServer != null) {
-            zkServer.removeCnxn(this);
-        }
-
-        if (channel.isOpen()) {
-            // Since we don't check on the futures created by write calls to the channel complete we need to make sure
-            // that all writes have been completed before closing the channel or we risk data loss
-            // See: http://lists.jboss.org/pipermail/netty-users/2009-August/001122.html
-            channel.writeAndFlush(Unpooled.EMPTY_BUFFER).addListener(new ChannelFutureListener() {
-                @Override
-                public void operationComplete(ChannelFuture future) {
-                    future.channel().close().addListener(f -> releaseQueuedBuffer());
-                }
-            });
-        } else {
-            ServerMetrics.getMetrics().CONNECTION_DROP_COUNT.add(1);
-            channel.eventLoop().execute(this::releaseQueuedBuffer);
-        }
-    }
-
-    @Override
-    public long getSessionId() {
-        return sessionId;
-    }
-
-    @Override
-    public int getSessionTimeout() {
-        return sessionTimeout;
-    }
-
-    @Override
-    public void process(WatchedEvent event) {
-        ReplyHeader h = new ReplyHeader(ClientCnxn.NOTIFICATION_XID, -1L, 0);
-        if (LOG.isTraceEnabled()) {
-            ZooTrace.logTraceMessage(
-                LOG,
-                ZooTrace.EVENT_DELIVERY_TRACE_MASK,
-                "Deliver event " + event + " to 0x" + Long.toHexString(this.sessionId) + " through " + this);
-        }
-
-        // Convert WatchedEvent to a type that can be sent over the wire
-        WatcherEvent e = event.getWrapper();
-
+    void sendBufferSync(ByteBuffer bb) {
         try {
-            int responseSize = sendResponse(h, e, "notification");
-            ServerMetrics.getMetrics().WATCH_BYTES.add(responseSize);
-        } catch (IOException e1) {
-            LOG.debug("Problem sending to {}", getRemoteSocketAddress(), e1);
-            close();
+            /* configure socket to be blocking
+             * so that we dont have to do write in
+             * a tight while loop
+             */
+            if (bb != ServerCnxnFactory.closeConn) {
+                if (sock.isOpen()) {
+                    sock.configureBlocking(true);
+                    sock.write(bb);
+                }
+                packetSent();
+            }
+        } catch (IOException ie) {
+            LOG.error("Error sending data synchronously ", ie);
         }
     }
 
-    @Override
-    public int sendResponse(ReplyHeader h, Record r, String tag,
-                             String cacheKey, Stat stat, int opCode) throws IOException {
-        // cacheKey and stat are used in caching, which is not
-        // implemented here. Implementation example can be found in NIOServerCnxn.
-        if (closingChannel || !channel.isOpen()) {
-            return 0;
-        }
-        ByteBuffer[] bb = serialize(h, r, tag, cacheKey, stat, opCode);
-        int responseSize = bb[0].getInt();
-        bb[0].rewind();
-        sendBuffer(bb);
-        decrOutstandingAndCheckThrottle(h);
-        return responseSize;
-    }
-
-    @Override
-    public void setSessionId(long sessionId) {
-        this.sessionId = sessionId;
-        factory.addSession(sessionId, this);
-    }
-
-    // Use a single listener instance to reduce GC
-    private final GenericFutureListener<Future<Void>> onSendBufferDoneListener = f -> {
-        if (f.isSuccess()) {
-            packetSent();
-        }
-    };
-
-    @Override
+    /**
+     * sendBuffer pushes a byte buffer onto the outgoing buffer queue for
+     * asynchronous writes.
+     */
     public void sendBuffer(ByteBuffer... buffers) {
-        if (buffers.length == 1 && buffers[0] == ServerCnxnFactory.closeConn) {
-            close(DisconnectReason.CLIENT_CLOSED_CONNECTION);
+        if (LOG.isTraceEnabled()) {
+            LOG.trace("Add a buffer to outgoingBuffers, sk {} is valid: {}", sk, sk.isValid());
+        }
+
+        synchronized (outgoingBuffers) {
+            for (ByteBuffer buffer : buffers) {
+                outgoingBuffers.add(buffer);
+            }
+            outgoingBuffers.add(packetSentinel);
+        }
+        requestInterestOpsUpdate();
+    }
+
+    /**
+     * When read on socket failed, this is typically because client closed the
+     * connection. In most cases, the client does this when the server doesn't
+     * respond within 2/3 of session timeout. This possibly indicates server
+     * health/performance issue, so we need to log and keep track of stat
+     *
+     * @throws EndOfStreamException
+     */
+    private void handleFailedRead() throws EndOfStreamException {
+        setStale();
+        ServerMetrics.getMetrics().CONNECTION_DROP_COUNT.add(1);
+        throw new EndOfStreamException("Unable to read additional data from client,"
+                + " it probably closed the socket:"
+                + " address = " + sock.socket().getRemoteSocketAddress() + ","
+                + " session = 0x" + Long.toHexString(sessionId),
+                DisconnectReason.UNABLE_TO_READ_FROM_CLIENT);
+    }
+
+    /** Read the request payload (everything following the length prefix) */
+    private void readPayload() throws IOException, InterruptedException, ClientCnxnLimitException {
+        if (incomingBuffer.remaining() != 0) { // have we read length bytes?
+            int rc = sock.read(incomingBuffer); // sock is non-blocking, so ok
+            if (rc < 0) {
+                handleFailedRead();
+            }
+        }
+
+        if (incomingBuffer.remaining() == 0) { // have we read length bytes?
+            incomingBuffer.flip();
+            packetReceived(4 + incomingBuffer.remaining());
+            if (!initialized) {
+                readConnectRequest();
+            } else {
+                readRequest();
+            }
+            lenBuffer.clear();
+            incomingBuffer = lenBuffer;
+        }
+    }
+
+    /**
+     * This boolean tracks whether the connection is ready for selection or
+     * not. A connection is marked as not ready for selection while it is
+     * processing an IO request. The flag is used to gatekeep pushing interest
+     * op updates onto the selector.
+     */
+    private final AtomicBoolean selectable = new AtomicBoolean(true);
+
+    public boolean isSelectable() {
+        return sk.isValid() && selectable.get();
+    }
+
+    public void disableSelectable() {
+        selectable.set(false);
+    }
+
+    public void enableSelectable() {
+        selectable.set(true);
+    }
+
+    private void requestInterestOpsUpdate() {
+        if (isSelectable()) {
+            selectorThread.addInterestOpsUpdateRequest(sk);
+        }
+    }
+
+    void handleWrite(SelectionKey k) throws IOException {
+        if (outgoingBuffers.isEmpty()) {
             return;
         }
-        channel.writeAndFlush(Unpooled.wrappedBuffer(buffers)).addListener(onSendBufferDoneListener);
+
+        /*
+         * This is going to reset the buffer position to 0 and the
+         * limit to the size of the buffer, so that we can fill it
+         * with data from the non-direct buffers that we need to
+         * send.
+         */
+        ByteBuffer directBuffer = NIOServerCnxnFactory.getDirectBuffer();
+        if (directBuffer == null) {
+            ByteBuffer[] bufferList = new ByteBuffer[outgoingBuffers.size()];
+            // Use gathered write call. This updates the positions of the
+            // byte buffers to reflect the bytes that were written out.
+            sock.write(outgoingBuffers.toArray(bufferList));
+
+            // Remove the buffers that we have sent
+            ByteBuffer bb;
+            while ((bb = outgoingBuffers.peek()) != null) {
+                if (bb == ServerCnxnFactory.closeConn) {
+                    throw new CloseRequestException("close requested", DisconnectReason.CLIENT_CLOSED_CONNECTION);
+                }
+                if (bb == packetSentinel) {
+                    packetSent();
+                }
+                if (bb.remaining() > 0) {
+                    break;
+                }
+                outgoingBuffers.remove();
+            }
+        } else {
+            directBuffer.clear();
+
+            for (ByteBuffer b : outgoingBuffers) {
+                if (directBuffer.remaining() < b.remaining()) {
+                    /*
+                     * When we call put later, if the directBuffer is to
+                     * small to hold everything, nothing will be copied,
+                     * so we've got to slice the buffer if it's too big.
+                     */
+                    b = (ByteBuffer) b.slice().limit(directBuffer.remaining());
+                }
+                /*
+                 * put() is going to modify the positions of both
+                 * buffers, put we don't want to change the position of
+                 * the source buffers (we'll do that after the send, if
+                 * needed), so we save and reset the position after the
+                 * copy
+                 */
+                int p = b.position();
+                directBuffer.put(b);
+                b.position(p);
+                if (directBuffer.remaining() == 0) {
+                    break;
+                }
+            }
+            /*
+             * Do the flip: limit becomes position, position gets set to
+             * 0. This sets us up for the write.
+             */
+            directBuffer.flip();
+
+            int sent = sock.write(directBuffer);
+
+            ByteBuffer bb;
+
+            // Remove the buffers that we have sent
+            while ((bb = outgoingBuffers.peek()) != null) {
+                if (bb == ServerCnxnFactory.closeConn) {
+                    throw new CloseRequestException("close requested", DisconnectReason.CLIENT_CLOSED_CONNECTION);
+                }
+                if (bb == packetSentinel) {
+                    packetSent();
+                }
+                if (sent < bb.remaining()) {
+                    /*
+                     * We only partially sent this buffer, so we update
+                     * the position and exit the loop.
+                     */
+                    bb.position(bb.position() + sent);
+                    break;
+                }
+                /* We've sent the whole buffer, so drop the buffer */
+                sent -= bb.remaining();
+                outgoingBuffers.remove();
+            }
+        }
+    }
+
+    /**
+     * Only used in order to allow testing
+     */
+    protected boolean isSocketOpen() {
+        return sock.isOpen();
+    }
+
+    /**
+     * Handles read/write IO on connection.
+     */
+    void doIO(SelectionKey k) throws InterruptedException {
+        try {
+            if (!isSocketOpen()) {
+                LOG.warn("trying to do i/o on a null socket for session: 0x{}", Long.toHexString(sessionId));
+
+                return;
+            }
+            if (k.isReadable()) {
+                int rc = sock.read(incomingBuffer);
+                if (rc < 0) {
+                    handleFailedRead();
+                }
+                if (incomingBuffer.remaining() == 0) {
+                    boolean isPayload;
+                    if (incomingBuffer == lenBuffer) { // start of next request
+                        incomingBuffer.flip();
+                        isPayload = readLength(k);
+                        incomingBuffer.clear();
+                    } else {
+                        // continuation
+                        isPayload = true;
+                    }
+                    if (isPayload) { // not the case for 4letterword
+                        readPayload();
+                    } else {
+                        // four letter words take care
+                        // need not do anything else
+                        return;
+                    }
+                }
+            }
+            if (k.isWritable()) {
+                handleWrite(k);
+
+                if (!initialized && !getReadInterest() && !getWriteInterest()) {
+                    throw new CloseRequestException("responded to info probe", DisconnectReason.INFO_PROBE);
+                }
+            }
+        } catch (CancelledKeyException e) {
+            LOG.warn("CancelledKeyException causing close of session: 0x{}", Long.toHexString(sessionId));
+
+            LOG.debug("CancelledKeyException stack trace", e);
+
+            close(DisconnectReason.CANCELLED_KEY_EXCEPTION);
+        } catch (CloseRequestException e) {
+            // expecting close to log session closure
+            close();
+        } catch (EndOfStreamException e) {
+            LOG.warn("Unexpected exception", e);
+            // expecting close to log session closure
+            close(e.getReason());
+        } catch (ClientCnxnLimitException e) {
+            // Common case exception, print at debug level
+            ServerMetrics.getMetrics().CONNECTION_REJECTED.add(1);
+            LOG.warn("Closing session 0x{}", Long.toHexString(sessionId), e);
+            close(DisconnectReason.CLIENT_CNX_LIMIT);
+        } catch (IOException e) {
+            LOG.warn("Close of session 0x{}", Long.toHexString(sessionId), e);
+            close(DisconnectReason.IO_EXCEPTION);
+        }
+    }
+
+    protected void readRequest() throws IOException {
+        zkServer.processPacket(this, incomingBuffer);
+    }
+
+    // returns whether we are interested in writing, which is determined
+    // by whether we have any pending buffers on the output queue or not
+    private boolean getWriteInterest() {
+        return !outgoingBuffers.isEmpty();
+    }
+
+    // returns whether we are interested in taking new requests, which is
+    // determined by whether we are currently throttled or not
+    private boolean getReadInterest() {
+        return !throttled.get();
+    }
+
+    private final AtomicBoolean throttled = new AtomicBoolean(false);
+
+    // Throttle acceptance of new requests. If this entailed a state change,
+    // register an interest op update request with the selector.
+    //
+    // Don't support wait disable receive in NIO, ignore the parameter
+    public void disableRecv(boolean waitDisableRecv) {
+        if (throttled.compareAndSet(false, true)) {
+            requestInterestOpsUpdate();
+        }
+    }
+
+    // Disable throttling and resume acceptance of new requests. If this
+    // entailed a state change, register an interest op update request with
+    // the selector.
+    public void enableRecv() {
+        if (throttled.compareAndSet(true, false)) {
+            requestInterestOpsUpdate();
+        }
+    }
+
+    private void readConnectRequest() throws IOException, InterruptedException, ClientCnxnLimitException {
+        if (!isZKServerRunning()) {
+            throw new IOException("ZooKeeperServer not running");
+        }
+        zkServer.processConnectRequest(this, incomingBuffer);
+        initialized = true;
     }
 
     /**
@@ -234,7 +453,7 @@ public class NettyServerCnxn extends ServerCnxn {
          */
         private void checkFlush(boolean force) {
             if ((force && sb.length() > 0) || sb.length() > 2048) {
-                sendBuffer(ByteBuffer.wrap(sb.toString().getBytes(UTF_8)));
+                sendBufferSync(ByteBuffer.wrap(sb.toString().getBytes(UTF_8)));
                 // clear our internal buffer
                 sb.setLength(0);
             }
@@ -261,9 +480,8 @@ public class NettyServerCnxn extends ServerCnxn {
         }
 
     }
-
     /** Return if four letter word found and responded to, otw false **/
-    private boolean checkFourLetterWord(final Channel channel, ByteBuf message, final int len) {
+    private boolean checkFourLetterWord(final SelectionKey k, final int len) throws IOException {
         // We take advantage of the limited size of the length to look
         // for cmds. They are all 4-bytes which fits inside of an int
         if (!FourLetterCommands.isKnown(len)) {
@@ -271,12 +489,24 @@ public class NettyServerCnxn extends ServerCnxn {
         }
 
         String cmd = FourLetterCommands.getCommandString(len);
-
-        // Stops automatic reads of incoming data on this channel. We don't
-        // expect any more traffic from the client when processing a 4LW
-        // so this shouldn't break anything.
-        channel.config().setAutoRead(false);
         packetReceived(4);
+
+        /** cancel the selection key to remove the socket handling
+         * from selector. This is to prevent netcat problem wherein
+         * netcat immediately closes the sending side after sending the
+         * commands and still keeps the receiving channel open.
+         * The idea is to remove the selectionkey from the selector
+         * so that the selector does not notice the closed read on the
+         * socket channel and keep the socket alive to write the data to
+         * and makes sure to close the socket after its done writing the data
+         */
+        if (k != null) {
+            try {
+                k.cancel();
+            } catch (Exception e) {
+                LOG.error("Error cancelling command selection key", e);
+            }
+        }
 
         final PrintWriter pwriter = new PrintWriter(new BufferedWriter(new SendBufferWriter()));
 
@@ -284,20 +514,23 @@ public class NettyServerCnxn extends ServerCnxn {
         if (!FourLetterCommands.isEnabled(cmd)) {
             LOG.debug("Command {} is not executed because it is not in the whitelist.", cmd);
             NopCommand nopCmd = new NopCommand(
-                pwriter,
-                this,
-                cmd + " is not executed because it is not in the whitelist.");
+                    pwriter,
+                    this,
+                    cmd + " is not executed because it is not in the whitelist.");
             nopCmd.start();
             return true;
         }
 
-        LOG.info("Processing {} command from {}", cmd, channel.remoteAddress());
+        LOG.info("Processing {} command from {}", cmd, sock.socket().getRemoteSocketAddress());
 
         if (len == FourLetterCommands.setTraceMaskCmd) {
-            ByteBuffer mask = ByteBuffer.allocate(8);
-            message.readBytes(mask);
-            mask.flip();
-            long traceMask = mask.getLong();
+            incomingBuffer = ByteBuffer.allocate(8);
+            int rc = sock.read(incomingBuffer);
+            if (rc < 0) {
+                throw new IOException("Read error");
+            }
+            incomingBuffer.flip();
+            long traceMask = incomingBuffer.getLong();
             ZooTrace.setTextTraceLevel(traceMask);
             SetTraceMaskCommand setMask = new SetTraceMaskCommand(pwriter, this, traceMask);
             setMask.start();
@@ -308,293 +541,215 @@ public class NettyServerCnxn extends ServerCnxn {
         }
     }
 
-    /**
-     * Helper that throws an IllegalStateException if the current thread is not
-     * executing in the channel's event loop thread.
-     * @param callerMethodName the name of the calling method to add to the exception message.
-     */
-    private void checkIsInEventLoop(String callerMethodName) {
-        if (!channel.eventLoop().inEventLoop()) {
-            throw new IllegalStateException(callerMethodName + "() called from non-EventLoop thread");
-        }
-    }
-
-    /**
-     * Appends <code>buf</code> to <code>queuedBuffer</code>. Does not duplicate <code>buf</code>
-     * or call any flavor of {@link ByteBuf#retain()}. Caller must ensure that <code>buf</code>
-     * is not owned by anyone else, as this call transfers ownership of <code>buf</code> to the
-     * <code>queuedBuffer</code>.
+    /** Reads the first 4 bytes of lenBuffer, which could be true length or
+     *  four letter word.
      *
-     * This method should only be called from the event loop thread.
-     * @param buf the buffer to append to the queue.
+     * @param k selection key
+     * @return true if length read, otw false (wasn't really the length)
+     * @throws IOException if buffer size exceeds maxBuffer size
      */
-    private void appendToQueuedBuffer(ByteBuf buf) {
-        checkIsInEventLoop("appendToQueuedBuffer");
-        if (queuedBuffer.numComponents() == queuedBuffer.maxNumComponents()) {
-            // queuedBuffer has reached its component limit, so combine the existing components.
-            queuedBuffer.consolidate();
+    private boolean readLength(SelectionKey k) throws IOException {
+        // Read the length, now get the buffer
+        int len = lenBuffer.getInt();
+        if (!initialized && checkFourLetterWord(sk, len)) {
+            return false;
         }
-        queuedBuffer.addComponent(true, buf);
-        ServerMetrics.getMetrics().NETTY_QUEUED_BUFFER.add(queuedBuffer.capacity());
+        if (len < 0 || len > BinaryInputArchive.maxBuffer) {
+            throw new IOException("Len error. "
+                    + "A message from " +  this.getRemoteSocketAddress() + " with advertised length of " + len
+                    + " is either a malformed message or too large to process"
+                    + " (length is greater than jute.maxbuffer=" + BinaryInputArchive.maxBuffer + ")");
+        }
+        if (!isZKServerRunning()) {
+            throw new IOException("ZooKeeperServer not running");
+        }
+        // checkRequestSize will throw IOException if request is rejected
+        zkServer.checkRequestSizeWhenReceivingMessage(len);
+        incomingBuffer = ByteBuffer.allocate(len);
+        return true;
+    }
+
+    /*
+     * (non-Javadoc)
+     *
+     * @see org.apache.zookeeper.server.ServerCnxnIface#getSessionTimeout()
+     */
+    public int getSessionTimeout() {
+        return sessionTimeout;
     }
 
     /**
-     * Process incoming message. This should only be called from the event
-     * loop thread.
-     * Note that this method does not call <code>buf.release()</code>. The caller
-     * is responsible for making sure the buf is released after this method
-     * returns.
-     * @param buf the message bytes to process.
+     * Used by "dump" 4-letter command to list all connection in
+     * cnxnExpiryMap
      */
-    void processMessage(ByteBuf buf) {
-        checkIsInEventLoop("processMessage");
-        LOG.debug("0x{} queuedBuffer: {}", Long.toHexString(sessionId), queuedBuffer);
-
-        if (LOG.isTraceEnabled()) {
-            LOG.trace("0x{} buf {}", Long.toHexString(sessionId), ByteBufUtil.hexDump(buf));
-        }
-
-        if (throttled.get()) {
-            LOG.debug("Received message while throttled");
-            // we are throttled, so we need to queue
-            if (queuedBuffer == null) {
-                LOG.debug("allocating queue");
-                queuedBuffer = channel.alloc().compositeBuffer();
-            }
-            appendToQueuedBuffer(buf.retainedDuplicate());
-            if (LOG.isTraceEnabled()) {
-                LOG.trace("0x{} queuedBuffer {}", Long.toHexString(sessionId), ByteBufUtil.hexDump(queuedBuffer));
-            }
-        } else {
-            LOG.debug("not throttled");
-            if (queuedBuffer != null) {
-                appendToQueuedBuffer(buf.retainedDuplicate());
-                processQueuedBuffer();
-            } else {
-                receiveMessage(buf);
-                // Have to check !closingChannel, because an error in
-                // receiveMessage() could have led to close() being called.
-                if (!closingChannel && buf.isReadable()) {
-                    if (LOG.isTraceEnabled()) {
-                        LOG.trace("Before copy {}", buf);
-                    }
-
-                    if (queuedBuffer == null) {
-                        queuedBuffer = channel.alloc().compositeBuffer();
-                    }
-                    appendToQueuedBuffer(buf.retainedSlice(buf.readerIndex(), buf.readableBytes()));
-                    if (LOG.isTraceEnabled()) {
-                        LOG.trace("Copy is {}", queuedBuffer);
-                        LOG.trace("0x{} queuedBuffer {}", Long.toHexString(sessionId), ByteBufUtil.hexDump(queuedBuffer));
-                    }
-                }
-            }
-        }
+    @Override
+    public String toString() {
+        return "ip: " + sock.socket().getRemoteSocketAddress() + " sessionId: 0x" + Long.toHexString(sessionId);
     }
 
     /**
-     * Try to process previously queued message. This should only be called
-     * from the event loop thread.
+     * Close the cnxn and remove it from the factory cnxns list.
      */
-    void processQueuedBuffer() {
-        checkIsInEventLoop("processQueuedBuffer");
-        if (queuedBuffer != null) {
-            if (LOG.isTraceEnabled()) {
-                LOG.trace("processing queue 0x{} queuedBuffer {}", Long.toHexString(sessionId), ByteBufUtil.hexDump(queuedBuffer));
-            }
-            receiveMessage(queuedBuffer);
-            if (closingChannel) {
-                // close() could have been called if receiveMessage() failed
-                LOG.debug("Processed queue - channel closed, dropping remaining bytes");
-            } else if (!queuedBuffer.isReadable()) {
-                LOG.debug("Processed queue - no bytes remaining");
-                releaseQueuedBuffer();
-            } else {
-                LOG.debug("Processed queue - bytes remaining");
-                // Try to reduce memory consumption by freeing up buffer space
-                // which is no longer needed.
-                queuedBuffer.discardReadComponents();
-            }
-        } else {
-            LOG.debug("queue empty");
+    @Override
+    public void close(DisconnectReason reason) {
+        disconnectReason = reason;
+        close();
+    }
+
+    private void close() {
+        setStale();
+        if (!factory.removeCnxn(this)) {
+            return;
         }
+
+        if (zkServer != null) {
+            zkServer.removeCnxn(this);
+        }
+
+        if (sk != null) {
+            try {
+                // need to cancel this selection key from the selector
+                sk.cancel();
+            } catch (Exception e) {
+                LOG.debug("ignoring exception during selectionkey cancel", e);
+            }
+        }
+
+        closeSock();
     }
 
     /**
-     * Clean up queued buffer once it's no longer needed. This should only be
-     * called from the event loop thread.
+     * Close resources associated with the sock of this cnxn.
      */
-    private void releaseQueuedBuffer() {
-        checkIsInEventLoop("releaseQueuedBuffer");
-        if (queuedBuffer != null) {
-            queuedBuffer.release();
-            queuedBuffer = null;
+    private void closeSock() {
+        if (!sock.isOpen()) {
+            return;
         }
+
+        String logMsg = String.format(
+                "Closed socket connection for client %s %s",
+                sock.socket().getRemoteSocketAddress(),
+                sessionId != 0
+                        ? "which had sessionid 0x" + Long.toHexString(sessionId)
+                        : "(no session established for client)"
+        );
+        LOG.debug(logMsg);
+
+        closeSock(sock);
     }
 
     /**
-     * Receive a message, which can come from the queued buffer or from a new
-     * buffer coming in over the channel. This should only be called from the
-     * event loop thread.
-     * Note that this method does not call <code>message.release()</code>. The
-     * caller is responsible for making sure the message is released after this
-     * method returns.
-     * @param message the message bytes to process.
+     * Close resources associated with a sock.
      */
-    private void receiveMessage(ByteBuf message) {
-        checkIsInEventLoop("receiveMessage");
+    public static void closeSock(SocketChannel sock) {
+        if (!sock.isOpen()) {
+            return;
+        }
+
         try {
-            while (message.isReadable() && !throttled.get()) {
-                if (bb != null) {
-                    if (LOG.isTraceEnabled()) {
-                        LOG.trace("message readable {} bb len {} {}", message.readableBytes(), bb.remaining(), bb);
-                        ByteBuffer dat = bb.duplicate();
-                        dat.flip();
-                        LOG.trace("0x{} bb {}", Long.toHexString(sessionId), ByteBufUtil.hexDump(Unpooled.wrappedBuffer(dat)));
-                    }
-
-                    if (bb.remaining() > message.readableBytes()) {
-                        int newLimit = bb.position() + message.readableBytes();
-                        bb.limit(newLimit);
-                    }
-                    message.readBytes(bb);
-                    bb.limit(bb.capacity());
-
-                    if (LOG.isTraceEnabled()) {
-                        LOG.trace("after readBytes message readable {} bb len {} {}", message.readableBytes(), bb.remaining(), bb);
-                        ByteBuffer dat = bb.duplicate();
-                        dat.flip();
-                        LOG.trace("after readbytes 0x{} bb {}",
-                                  Long.toHexString(sessionId),
-                                  ByteBufUtil.hexDump(Unpooled.wrappedBuffer(dat)));
-                    }
-                    if (bb.remaining() == 0) {
-                        bb.flip();
-                        packetReceived(4 + bb.remaining());
-
-                        ZooKeeperServer zks = this.zkServer;
-                        if (zks == null || !zks.isRunning()) {
-                            throw new IOException("ZK down");
-                        }
-                        if (initialized) {
-                            // TODO: if zks.processPacket() is changed to take a ByteBuffer[],
-                            // we could implement zero-copy queueing.
-                            zks.processPacket(this, bb);
-                        } else {
-                            LOG.debug("got conn req request from {}", getRemoteSocketAddress());
-                            zks.processConnectRequest(this, bb);
-                            initialized = true;
-                        }
-                        bb = null;
-                    }
-                } else {
-                    if (LOG.isTraceEnabled()) {
-                        LOG.trace("message readable {} bblenrem {}", message.readableBytes(), bbLen.remaining());
-                        ByteBuffer dat = bbLen.duplicate();
-                        dat.flip();
-                        LOG.trace("0x{} bbLen {}", Long.toHexString(sessionId), ByteBufUtil.hexDump(Unpooled.wrappedBuffer(dat)));
-                    }
-
-                    if (message.readableBytes() < bbLen.remaining()) {
-                        bbLen.limit(bbLen.position() + message.readableBytes());
-                    }
-                    message.readBytes(bbLen);
-                    bbLen.limit(bbLen.capacity());
-                    if (bbLen.remaining() == 0) {
-                        bbLen.flip();
-
-                        if (LOG.isTraceEnabled()) {
-                            LOG.trace("0x{} bbLen {}", Long.toHexString(sessionId), ByteBufUtil.hexDump(Unpooled.wrappedBuffer(bbLen)));
-                        }
-                        int len = bbLen.getInt();
-                        if (LOG.isTraceEnabled()) {
-                            LOG.trace("0x{} bbLen len is {}", Long.toHexString(sessionId), len);
-                        }
-
-                        bbLen.clear();
-                        if (!initialized) {
-                            if (checkFourLetterWord(channel, message, len)) {
-                                return;
-                            }
-                        }
-                        if (len < 0 || len > BinaryInputArchive.maxBuffer) {
-                            throw new IOException("Len error " + len);
-                        }
-                        ZooKeeperServer zks = this.zkServer;
-                        if (zks == null || !zks.isRunning()) {
-                            LOG.info("Closing connection to {} because the server is not ready",
-                                    getRemoteSocketAddress());
-                            close(DisconnectReason.IO_EXCEPTION);
-                            return;
-                        }
-                        // checkRequestSize will throw IOException if request is rejected
-                        zks.checkRequestSizeWhenReceivingMessage(len);
-                        bb = ByteBuffer.allocate(len);
-                    }
-                }
-            }
+            /*
+             * The following sequence of code is stupid! You would think that
+             * only sock.close() is needed, but alas, it doesn't work that way.
+             * If you just do sock.close() there are cases where the socket
+             * doesn't actually close...
+             */
+            sock.socket().shutdownOutput();
         } catch (IOException e) {
-            LOG.warn("Closing connection to {}", getRemoteSocketAddress(), e);
-            close(DisconnectReason.IO_EXCEPTION);
-        } catch (ClientCnxnLimitException e) {
-            // Common case exception, print at debug level
-            ServerMetrics.getMetrics().CONNECTION_REJECTED.add(1);
-
-            LOG.debug("Closing connection to {}", getRemoteSocketAddress(), e);
-            close(DisconnectReason.CLIENT_RATE_LIMIT);
+            // This is a relatively common exception that we can't avoid
+            LOG.debug("ignoring exception during output shutdown", e);
+        }
+        try {
+            sock.socket().shutdownInput();
+        } catch (IOException e) {
+            // This is a relatively common exception that we can't avoid
+            LOG.debug("ignoring exception during input shutdown", e);
+        }
+        try {
+            sock.socket().close();
+        } catch (IOException e) {
+            LOG.debug("ignoring exception during socket close", e);
+        }
+        try {
+            sock.close();
+        } catch (IOException e) {
+            LOG.debug("ignoring exception during socketchannel close", e);
         }
     }
 
-    /**
-     * An event that triggers a change in the channel's read setting.
-     * Used for throttling. By using an enum we can treat the two values as
-     * singletons and compare with ==.
-     */
-    enum ReadEvent {
-        DISABLE,
-        ENABLE
-    }
-
-    /**
-     * Note that the netty implementation ignores the <code>waitDisableRecv</code>
-     * parameter and is always asynchronous.
-     * @param waitDisableRecv ignored by this implementation.
-     */
-    @Override
-    public void disableRecv(boolean waitDisableRecv) {
-        if (throttled.compareAndSet(false, true)) {
-            LOG.debug("Throttling - disabling recv {}", this);
-            channel.pipeline().fireUserEventTriggered(ReadEvent.DISABLE);
-        }
-    }
+    private static final ByteBuffer packetSentinel = ByteBuffer.allocate(0);
 
     @Override
-    public void enableRecv() {
-        if (throttled.compareAndSet(true, false)) {
-            LOG.debug("Sending unthrottle event {}", this);
-            channel.pipeline().fireUserEventTriggered(ReadEvent.ENABLE);
+    public int sendResponse(ReplyHeader h, Record r, String tag, String cacheKey, Stat stat, int opCode) {
+        int responseSize = 0;
+        try {
+            ByteBuffer[] bb = serialize(h, r, tag, cacheKey, stat, opCode);
+            responseSize = bb[0].getInt();
+            bb[0].rewind();
+            sendBuffer(bb);
+            decrOutstandingAndCheckThrottle(h);
+        } catch (Exception e) {
+            LOG.warn("Unexpected exception. Destruction averted.", e);
         }
+        return responseSize;
+    }
+
+    /*
+     * (non-Javadoc)
+     *
+     * @see org.apache.zookeeper.server.ServerCnxnIface#process(org.apache.zookeeper.proto.WatcherEvent)
+     */
+    @Override
+    public void process(WatchedEvent event) {
+        ReplyHeader h = new ReplyHeader(ClientCnxn.NOTIFICATION_XID, -1L, 0);
+        if (LOG.isTraceEnabled()) {
+            ZooTrace.logTraceMessage(
+                    LOG,
+                    ZooTrace.EVENT_DELIVERY_TRACE_MASK,
+                    "Deliver event " + event + " to 0x" + Long.toHexString(this.sessionId) + " through " + this);
+        }
+
+        // Convert WatchedEvent to a type that can be sent over the wire
+        WatcherEvent e = event.getWrapper();
+
+        // The last parameter OpCode here is used to select the response cache.
+        // Passing OpCode.error (with a value of -1) means we don't care, as we don't need
+        // response cache on delivering watcher events.
+        int responseSize = sendResponse(h, e, "notification", null, null, ZooDefs.OpCode.error);
+        ServerMetrics.getMetrics().WATCH_BYTES.add(responseSize);
+    }
+
+    /*
+     * (non-Javadoc)
+     *
+     * @see org.apache.zookeeper.server.ServerCnxnIface#getSessionId()
+     */
+    @Override
+    public long getSessionId() {
+        return sessionId;
+    }
+
+    @Override
+    public void setSessionId(long sessionId) {
+        this.sessionId = sessionId;
+        factory.addSession(sessionId, this);
     }
 
     @Override
     public void setSessionTimeout(int sessionTimeout) {
         this.sessionTimeout = sessionTimeout;
+        factory.touchCnxn(this);
     }
 
     @Override
     public int getInterestOps() {
-        // This might not be 100% right, but it's only used for printing
-        // connection info in the netty implementation so it's probably ok.
-        if (channel == null || !channel.isOpen()) {
+        if (!isSelectable()) {
             return 0;
         }
         int interestOps = 0;
-        if (!throttled.get()) {
+        if (getReadInterest()) {
             interestOps |= SelectionKey.OP_READ;
         }
-        if (!channel.isWritable()) {
-            // OP_READ means "can read", but OP_WRITE means "cannot write",
-            // it's weird.
+        if (getWriteInterest()) {
             interestOps |= SelectionKey.OP_WRITE;
         }
         return interestOps;
@@ -602,14 +757,17 @@ public class NettyServerCnxn extends ServerCnxn {
 
     @Override
     public InetSocketAddress getRemoteSocketAddress() {
-        return (InetSocketAddress) channel.remoteAddress();
+        if (!sock.isOpen()) {
+            return null;
+        }
+        return (InetSocketAddress) sock.socket().getRemoteSocketAddress();
     }
 
-    /** Send close connection packet to the client.
-     */
-    @Override
-    public void sendCloseSession() {
-        sendBuffer(ServerCnxnFactory.closeConn);
+    public InetAddress getSocketAddress() {
+        if (!sock.isOpen()) {
+            return null;
+        }
+        return sock.socket().getInetAddress();
     }
 
     @Override
@@ -622,44 +780,17 @@ public class NettyServerCnxn extends ServerCnxn {
 
     @Override
     public boolean isSecure() {
-        return factory.secure;
+        return false;
     }
 
     @Override
     public Certificate[] getClientCertificateChain() {
-        if (clientChain == null) {
-            return null;
-        }
-        return Arrays.copyOf(clientChain, clientChain.length);
+        throw new UnsupportedOperationException("SSL is unsupported in NIOServerCnxn");
     }
 
     @Override
     public void setClientCertificateChain(Certificate[] chain) {
-        if (chain == null) {
-            clientChain = null;
-        } else {
-            clientChain = Arrays.copyOf(chain, chain.length);
-        }
+        throw new UnsupportedOperationException("SSL is unsupported in NIOServerCnxn");
     }
 
-    // For tests and NettyServerCnxnFactory only, thus package-private.
-    Channel getChannel() {
-        return channel;
-    }
-
-    public int getQueuedReadableBytes() {
-        checkIsInEventLoop("getQueuedReadableBytes");
-        if (queuedBuffer != null) {
-            return queuedBuffer.readableBytes();
-        }
-        return 0;
-    }
-
-    public void setHandshakeState(HandshakeState state) {
-        this.handshakeState = state;
-    }
-
-    public HandshakeState getHandshakeState() {
-        return this.handshakeState;
-    }
 }
