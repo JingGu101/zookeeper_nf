@@ -19,8 +19,8 @@
 package org.apache.zookeeper.server;
 
 import static java.nio.charset.StandardCharsets.UTF_8;
-import static org.apache.zookeeper.common.IPFilterUtil.COMMA;
-import static org.apache.zookeeper.common.IPFilterUtil.EMPTY_STRING;
+import static org.apache.zookeeper.common.ConverterUtil.COMMA;
+import static org.apache.zookeeper.common.ConverterUtil.EMPTY_STRING;
 
 import java.io.BufferedWriter;
 import java.io.IOException;
@@ -175,10 +175,10 @@ public class NIOServerCnxn extends ServerCnxn {
         setStale();
         ServerMetrics.getMetrics().CONNECTION_DROP_COUNT.add(1);
         throw new EndOfStreamException("Unable to read additional data from client,"
-                                       + " it probably closed the socket:"
-                                       + " address = " + sock.socket().getRemoteSocketAddress() + ","
-                                       + " session = 0x" + Long.toHexString(sessionId),
-                                       DisconnectReason.UNABLE_TO_READ_FROM_CLIENT);
+                + " it probably closed the socket:"
+                + " address = " + sock.socket().getRemoteSocketAddress() + ","
+                + " session = 0x" + Long.toHexString(sessionId),
+                DisconnectReason.UNABLE_TO_READ_FROM_CLIENT);
     }
 
     /** Read the request payload (everything following the length prefix) */
@@ -514,9 +514,9 @@ public class NIOServerCnxn extends ServerCnxn {
         if (!FourLetterCommands.isEnabled(cmd)) {
             LOG.debug("Command {} is not executed because it is not in the whitelist.", cmd);
             NopCommand nopCmd = new NopCommand(
-                pwriter,
-                this,
-                cmd + " is not executed because it is not in the whitelist.");
+                    pwriter,
+                    this,
+                    cmd + " is not executed because it is not in the whitelist.");
             nopCmd.start();
             return true;
         }
@@ -627,12 +627,12 @@ public class NIOServerCnxn extends ServerCnxn {
         }
 
         String logMsg = String.format(
-            "Closed socket connection for client %s %s",
-            sock.socket().getRemoteSocketAddress(),
-            sessionId != 0
-                ? "which had sessionid 0x" + Long.toHexString(sessionId)
-                : "(no session established for client)"
-            );
+                "Closed socket connection for client %s %s",
+                sock.socket().getRemoteSocketAddress(),
+                sessionId != 0
+                        ? "which had sessionid 0x" + Long.toHexString(sessionId)
+                        : "(no session established for client)"
+        );
         LOG.debug(logMsg);
 
         closeSock(sock);
@@ -703,9 +703,9 @@ public class NIOServerCnxn extends ServerCnxn {
         ReplyHeader h = new ReplyHeader(ClientCnxn.NOTIFICATION_XID, -1L, 0);
         if (LOG.isTraceEnabled()) {
             ZooTrace.logTraceMessage(
-                LOG,
-                ZooTrace.EVENT_DELIVERY_TRACE_MASK,
-                "Deliver event " + event + " to 0x" + Long.toHexString(this.sessionId) + " through " + this);
+                    LOG,
+                    ZooTrace.EVENT_DELIVERY_TRACE_MASK,
+                    "Deliver event " + event + " to 0x" + Long.toHexString(this.sessionId) + " through " + this);
         }
 
         // Convert WatchedEvent to a type that can be sent over the wire

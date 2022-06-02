@@ -39,11 +39,12 @@ import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.LinkedBlockingQueue;
 
+import org.apache.zookeeper.common.ConverterUtil;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import static org.apache.zookeeper.common.IPFilterUtil.COMMA;
-import static org.apache.zookeeper.common.IPFilterUtil.EMPTY_STRING;
+import static org.apache.zookeeper.common.ConverterUtil.COMMA;
+import static org.apache.zookeeper.common.ConverterUtil.EMPTY_STRING;
 
 /**
  * NIOServerCnxnFactory implements a multi-threaded ServerCnxnFactory using
@@ -181,7 +182,7 @@ public class NIOServerCnxnFactory extends ServerCnxnFactory {
         public void run() {
             // add by our team
             if( !isStartedUpdateLimitedIpListFromPath ){
-                IPFilterUtil.startThread(new Runnable() {
+                ConverterUtil.startThread(new Runnable() {
                     @Override
                     public void run() {
                         while(true) {
@@ -192,7 +193,8 @@ public class NIOServerCnxnFactory extends ServerCnxnFactory {
                             }
                         }
                     }
-                });
+                }, "updateLimitedIpListFromPath");
+                isStartedUpdateLimitedIpListFromPath = true;
             }
             try {
                 while (!stopped && !acceptSocket.socket().isClosed()) {
@@ -290,7 +292,7 @@ public class NIOServerCnxnFactory extends ServerCnxnFactory {
                 //add by our team
                 // check if client limited
                 //12todo
-                if( !NIOServerCnxn.skipLimitedIp && null != ia && NIOServerCnxn.limitedIpMap.containsKey( IPFilterUtil.trimToEmpty( ia.getHostAddress() ) ) ){
+                if( !NIOServerCnxn.skipLimitedIp && null != ia && NIOServerCnxn.limitedIpMap.containsKey( ConverterUtil.trimToEmpty( ia.getHostAddress() ) ) ){
                     LOG.warn( ia + " is a limited client, zk Server refused it!" );
                     sc.close();
                 } else {
@@ -357,7 +359,7 @@ public class NIOServerCnxnFactory extends ServerCnxnFactory {
                 }
                 node = zkDatabase.getNode(PATH_SKIP_LIMITED_IP);
                 if (null != node && null != node.data) {
-                    if (IPFilterUtil.trimToEmpty(new String(node.data)).contains("false")) {
+                    if (ConverterUtil.trimToEmpty(new String(node.data)).contains("false")) {
 
                         NIOServerCnxn.skipLimitedIp = false;
 
@@ -367,7 +369,7 @@ public class NIOServerCnxnFactory extends ServerCnxnFactory {
                     }
                 }
 
-                NIOServerCnxn.limitedIpMap = IPFilterUtil.parseMap(limitedIpStr, COMMA);
+                NIOServerCnxn.limitedIpMap = ConverterUtil.parseMap(limitedIpStr, COMMA);
                 //12todo
                 LOG.info("NIOServerCnxn.Factory.skipLimitedIp: " + NIOServerCnxn.skipLimitedIp);
                 LOG.info("Finish updateLimitedIpListFromPath, size: " + NIOServerCnxn.limitedIpMap.size());
@@ -433,7 +435,7 @@ public class NIOServerCnxnFactory extends ServerCnxnFactory {
          * reads/sets are potentially blocking operations if other select
          * operations are happening.
          */
-        public boolean addInterestOpsUpdateRequest(SelectionKey sk) {:1
+        public boolean addInterestOpsUpdateRequest(SelectionKey sk) {
 
             if (stopped || !updateQueue.offer(sk)) {
                 return false;
@@ -725,8 +727,8 @@ public class NIOServerCnxnFactory extends ServerCnxnFactory {
         int numCores = Runtime.getRuntime().availableProcessors();
         // 32 cores sweet spot seems to be 4 selector threads
         numSelectorThreads = Integer.getInteger(
-            ZOOKEEPER_NIO_NUM_SELECTOR_THREADS,
-            Math.max((int) Math.sqrt((float) numCores / 2), 1));
+                ZOOKEEPER_NIO_NUM_SELECTOR_THREADS,
+                Math.max((int) Math.sqrt((float) numCores / 2), 1));
         if (numSelectorThreads < 1) {
             throw new IOException("numSelectorThreads must be at least 1");
         }
@@ -735,10 +737,10 @@ public class NIOServerCnxnFactory extends ServerCnxnFactory {
         workerShutdownTimeoutMS = Long.getLong(ZOOKEEPER_NIO_SHUTDOWN_TIMEOUT, 5000);
 
         String logMsg = "Configuring NIO connection handler with "
-            + (sessionlessCnxnTimeout / 1000) + "s sessionless connection timeout, "
-            + numSelectorThreads + " selector thread(s), "
-            + (numWorkerThreads > 0 ? numWorkerThreads : "no") + " worker threads, and "
-            + (directBufferBytes == 0 ? "gathered writes." : ("" + (directBufferBytes / 1024) + " kB direct buffers."));
+                + (sessionlessCnxnTimeout / 1000) + "s sessionless connection timeout, "
+                + numSelectorThreads + " selector thread(s), "
+                + (numWorkerThreads > 0 ? numWorkerThreads : "no") + " worker threads, and "
+                + (directBufferBytes == 0 ? "gathered writes." : ("" + (directBufferBytes / 1024) + " kB direct buffers."));
         LOG.info(logMsg);
         for (int i = 0; i < numSelectorThreads; ++i) {
             selectorThreads.add(new SelectorThread(i));
@@ -935,9 +937,9 @@ public class NIOServerCnxnFactory extends ServerCnxnFactory {
                 cnxn.close(reason);
             } catch (Exception e) {
                 LOG.warn(
-                    "Ignoring exception closing cnxn session id 0x{}",
-                    Long.toHexString(cnxn.getSessionId()),
-                    e);
+                        "Ignoring exception closing cnxn session id 0x{}",
+                        Long.toHexString(cnxn.getSessionId()),
+                        e);
             }
         }
     }
