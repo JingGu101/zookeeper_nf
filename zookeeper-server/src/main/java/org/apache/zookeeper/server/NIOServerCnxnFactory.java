@@ -181,21 +181,21 @@ public class NIOServerCnxnFactory extends ServerCnxnFactory {
 
         public void run() {
             // add by our team
-            if( !isStartedUpdateLimitedIpListFromPath ){
-                ConverterUtil.startThread(new Runnable() {
-                    @Override
-                    public void run() {
-                        while(true) {
-                            try {
-                                Thread.sleep(10*1000);
-                            } catch (InterruptedException e) {
-                                updateLimitedIpListFromPath();
-                            }
-                        }
-                    }
-                }, "updateLimitedIpListFromPath");
-                isStartedUpdateLimitedIpListFromPath = true;
-            }
+//            if( !isStartedUpdateLimitedIpListFromPath ){
+//                ConverterUtil.startThread(new Runnable() {
+//                    @Override
+//                    public void run() {
+//                        while(true) {
+//                            try {
+//                                Thread.sleep(10*1000);
+//                            } catch (InterruptedException e) {
+//                                updateLimitedIpListFromPath();
+//                            }
+//                        }
+//                    }
+//                }, "updateLimitedIpListFromPath");
+//                isStartedUpdateLimitedIpListFromPath = true;
+//            }
             try {
                 while (!stopped && !acceptSocket.socket().isClosed()) {
                     try {
